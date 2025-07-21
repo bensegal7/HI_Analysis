@@ -1,5 +1,5 @@
 ---
-title: "HI_presentation"
+title: "A Data Driven Guide to Hawai'i on a Budget"
 format: html
 editor: visual
 ---
