@@ -1,0 +1,597 @@
+---
+title: "Data-Driven Guide to Booking an Airbnb in HI"
+output:
+  html_notebook: default
+  pdf_document:
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+
+# This chunk shows/hides the code in your final report. When echo = TRUE, the code
+# is shown in the report. When echo = FALSE, the code is hidden from the final report.
+# We would like to see your code, so please leave the setting as is during the course.
+# This chunk will not show up in your reports, so you can safely ignore its existence.
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r}
+install.packages("tidymodels")
+library("tidyverse")
+library("tidymodels")
+install.packages("ggthemes")
+library("ggthemes")
+library("scales")
+install.packages("leaflet")
+library(leaflet)
+install.packages("writexl")
+library(writexl)
+library(geosphere)
+install.packages("rsample")
+library("rsample")
+install.packages("car")
+library(car)
+install.packages("maps")
+library("maps")
+install.packages("dplyr")
+library("dplyr")
+
+
+packageVersion("dplyr")
+```
+
+```{r}
+# LOADING THE DATA
+
+dfaORG <- read_csv("data/dfhi.csv") %>% 
+  mutate(high_booking = as.factor(high_booking))
+
+head(dfaORG)
+
+df_locations <- read_csv("data/HI_locations.csv")
+
+head(df_locations)
+```
+
+```{r}
+# data cleaning/wrangling
+
+# "Warning: NAs introduced by coercion" is fine to ignore.
+
+# Cleaning to remove dollar sign
+
+remove_dollar_sign <- c("weekly_price", "security_deposit", "price","monthly_price", "extra_people", "cleaning_fee")
+
+dfa <-
+  dfaORG %>%
+  mutate_at(remove_dollar_sign, ~str_replace_all(., pattern="\\$", replacement="")) %>%
+  mutate_at(remove_dollar_sign, ~str_replace_all(., pattern=",", replacement="")) %>%
+  mutate_at(remove_dollar_sign, ~as.numeric(.))
+
+# cleaning to remove pct symbol
+
+remove_pct_sign <- c("host_response_rate")
+
+df <-
+  dfa %>%
+  mutate_at(remove_pct_sign, ~str_replace_all(., pattern="\\%", replacement="")) %>%
+  mutate_at(remove_pct_sign, ~as.numeric(.)) %>%
+  mutate_at(remove_pct_sign, ~./100)
+
+#Cleaning to log price, there is a huge right skew
+
+df <- df %>%
+  mutate(
+    log_price = log(price)
+     )
+
+#Creating amenities_count
+
+df <- df %>%
+  mutate(
+    amenities_clean = str_remove_all(amenities, "[\\{\\}]"),
+    amenities_list = str_split(amenities_clean, ",\\s*"),
+    amenities_count = map_int(amenities_list, length)
+  )
+
+#cleaning other and n/a markets
+
+df <- df %>%
+  filter(! market %in% c("NA", "Other (Domestic)"), !is.na(market))
+
+#renaming "Big Island" and "The Big Island" to "Big Island"
+
+df <- df %>%
+  mutate(
+    market = str_trim(market),
+    market = str_to_title(market),
+    market = case_when(
+      market == "The Big Island" ~ "Big Island",
+      TRUE ~ market
+    )
+  )
+
+#Merging with the landmarks dataset to create the "type" column
+
+df <- df %>%
+  rowwise() %>%
+  mutate(
+    type = {
+      # Calculate distances to all locations
+      distances <- distGeo(
+        matrix(c(longitude, latitude), ncol = 2),
+        matrix(c(df_locations$longitude, df_locations$latitude), ncol = 2)
+      )
+      # Extract the type of the closest location
+      df_locations$type[which.min(distances)]
+    }
+  ) %>%
+  ungroup()
+
+#creating the distance to closest landmark column
+
+df <- df %>%
+  rowwise() %>%
+  mutate(
+    dist_to_landmark = {
+      #Calculate distance (meters) to the nearest landmark for all listings
+      distances <- distGeo(
+        matrix(c(longitude, latitude), ncol = 2),
+        matrix(c(df_locations$longitude, df_locations$latitude), ncol = 2)
+      )
+      min(distances, na.rm = TRUE)
+    }
+  )
+
+
+```
+
+```{r}
+# DATA EXPLORATION
+
+head(df_trim)
+
+#Dispersion of nightly prices on each island
+df_trim %>%
+  ggplot(aes(y = log_price, fill = market)) +
+  geom_boxplot(width = 2.5) +
+  scale_x_discrete(, breaks = NULL) +
+  labs(
+    title = "Nightly Prices in the HI Airbnb Market", 
+    y = NULL, x = "*Logarithmic Transformation Used on Price", 
+    fill = NULL) +
+  theme_bw()
+
+#Number of amenities vs price
+
+df_trim %>%
+  ggplot(aes(y = log_price, x = amenities_count)) +
+  geom_point(width = 2.5) +
+  labs(
+    title = "Nightly Prices vs Number of Amenities",
+    y = "Price",
+    x = "Number of Amenities"
+  ) +
+  scale_x_discrete(, breaks = NULL) +
+  scale_y_discrete(, breaks = NULL) +
+  theme_bw() +
+  geom_smooth()
+
+#High booking rate for the state
+
+df_trim %>%
+  ggplot(aes(x = high_booking, fill = high_booking)) +
+  geom_bar(show.legend = FALSE) +
+  labs(
+    title = "HI Airbnb Booking Rates",
+    x = "High Booking?",
+    y = NULL,
+    fill = NULL
+  ) +
+  scale_y_continuous(, breaks = NULL,
+                     expand = expansion(mult = c(0, 0.10))) +
+  theme_bw()
+
+#booking rate vs price
+
+df_trim %>%
+  ggplot(aes(y = log_price, fill = high_booking)) +
+  geom_boxplot(width = 2.5) +
+  scale_x_discrete(, breaks = NULL) +
+  labs(
+    title = "Do High Booking Rates Have Affect on Price?", 
+    y = NULL, x = "*Logarithmic Transformation Used on Price", 
+    fill = NULL) +
+  theme_bw()
+
+#average price by neighborhood
+
+df_trim %>%
+  group_by(host_neighbourhood) %>%                     # Data wrangling to get average price
+  summarize(avg_price = mean(price, na.rm = TRUE)) %>%
+  ungroup() %>%
+  
+  slice_max(order_by = avg_price, n = 8) %>%           #Getting the top 8
+  
+  ggplot(aes(                                          #Plotting
+    x = reorder(host_neighbourhood, avg_price),
+    y = avg_price,
+    fill = host_neighbourhood
+  )) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() + #horizontal bars
+  labs(
+    title = "Most Expensive Neighborhoods to Stay in HI (Airbnb)",
+    fill = NULL,
+    x = NULL,
+    y = "*Nightly Avg Rental Costs"
+  ) +
+  theme_bw() +
+  scale_y_continuous(, breaks = NULL,
+                    expand = expansion(mult = c(0, 0.10))) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0)
+  ) +
+  geom_text(
+    aes(label = dollar(round(avg_price, 0))),
+    position = position_stack(vjust = 0.5),
+    color = "white",
+    size = 3,
+    fontface = "bold"
+  )
+
+#Type prices visualization
+
+df_trim %>%
+  ggplot(aes(y = log_price, fill = type)) +
+  geom_boxplot(width = 2.5) +
+  scale_x_discrete(, breaks = NULL) +
+  labs(
+    title = "Prices by Geography Type in HI (Airbnb)", 
+    y = NULL, x = "*Logarithmic Transformation Used on Price", 
+    fill = NULL) +
+  theme_bw()
+
+#Amount of location types pie chart, had to make another smaller data frame for it
+df_counts <- df_trim %>%
+  count(type)
+
+df_counts %>%
+  ggplot(aes(x = "", y = n, fill = type)) +
+  geom_col(color = "black", width = 5) +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = percent(n / sum(n))),
+            position = position_stack(vjust = 0.75),
+            color = "white", fontface = "bold") +
+  labs(
+    title = "Distribution of Airbnb Listing Types in HI (Airbnb)",
+    fill = NULL,
+    y = NULL,
+    x = NULL,
+  ) +
+  theme_void() 
+
+#price skewness -> showing why the log transformation was done
+
+df_trim %>%
+  ggplot(aes(x = price)) +
+  geom_histogram() +
+  labs(
+    title = "Distribution of price",
+    y = "Frequency"
+  ) +
+  theme_bw()
+
+#after log_price transformation
+
+df_trim %>%
+  ggplot(aes(x = log_price)) +
+  geom_histogram() +
+  labs(
+    title = "Distribution of log_price",
+    y = "Frequency"
+  ) +
+  theme_bw()
+
+#Cheapest neighborhoods
+df_trim %>%
+  group_by(host_neighbourhood) %>%                     # Data wrangling to get average price
+  summarize(avg_price = mean(price, na.rm = TRUE)) %>%
+  ungroup() %>%
+  
+  slice_min(order_by = avg_price, n = 8) %>%           #Getting the top 8
+  
+  ggplot(aes(                                          #Plotting
+    x = fct_reorder(host_neighbourhood, avg_price, .desc = TRUE),
+    y = avg_price,
+    fill = host_neighbourhood
+  )) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() + #horizontal bars
+  labs(
+    title = "Least Neighborhoods to Stay in HI (Airbnb)",
+    fill = NULL,
+    x = NULL,
+    y = "*Nightly Avg Rental Costs"
+  ) +
+  theme_bw() +
+  scale_y_continuous(, breaks = NULL,
+                    expand = expansion(mult = c(0, 0.10))) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0)
+  ) +
+  geom_text(
+    aes(label = dollar(round(avg_price, 0))),
+    position = position_stack(vjust = 0.5),
+    color = "white",
+    size = 3,
+    fontface = "bold"
+  )
+
+#location type by cluster
+df_trim %>%
+  count(cluster,type) %>%
+  group_by(cluster) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = "", y = prop, fill = type)) +
+  geom_col(width = 1, color = "black") +
+  coord_polar(theta = "y") +
+  facet_wrap(~ cluster, strip.position = "bottom") +
+  geom_text(aes(label = percent(prop, accuracy = 1)),
+            position = position_stack(vjust = 0.5),
+            color = "white", fontface = "bold", size = 4) +
+  theme_void() +
+  labs(
+    title = "Location Type by Cluster",
+    fill = NULL
+  )
+
+#average price by cluster
+df_trim %>%
+  group_by(cluster) %>%                     # Data wrangling to get average price
+  summarize(avg_price = mean(price, na.rm = TRUE)) %>%
+  ungroup() %>%
+  
+  slice_min(order_by = avg_price, n = 3) %>%           #Getting the bottom 8
+  
+  ggplot(aes(                                          #Plotting
+    x = fct_reorder(cluster, avg_price, .desc = TRUE),
+    y = avg_price,
+    fill = cluster
+  )) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(
+    title = "Average Price by Cluster",
+    x = "cluster"
+  )+
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_y_continuous(, breaks = NULL,
+                    expand = expansion(mult = c(0, 0.10))) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0)
+  ) +
+  geom_text(
+    aes(label = dollar(round(avg_price, 0))),
+    position = position_stack(vjust = 0.5),
+    color = "white",
+    size = 3,
+    fontface = "bold"
+  )
+
+#room_type avg price
+df_trim %>%
+  group_by(room_type) %>%                     # Data wrangling to get average price
+  summarize(avg_price = mean(price, na.rm = TRUE)) %>%
+  ungroup() %>%
+  
+  slice_min(order_by = avg_price, n = 4) %>%           #Getting the bottom 8
+  
+  ggplot(aes(                                          #Plotting
+    x = fct_reorder(room_type, avg_price, .desc = TRUE),
+    y = avg_price,
+    fill = room_type
+  )) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(
+    title = "Average Price by Rental Type",
+    x = NULL
+  )+
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_y_continuous(, breaks = NULL,
+                    expand = expansion(mult = c(0, 0.10))) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0)
+  ) +
+  geom_text(
+    aes(label = dollar(round(avg_price, 0))),
+    position = position_stack(vjust = 0.5),
+    color = "white",
+    size = 3,
+    fontface = "bold"
+  )
+
+#room type by cluster ** CHANGE TO A BAR CHART FACET WRAPPED
+df_trim %>%
+  count(cluster,property_type) %>%
+  group_by(cluster) %>%
+  mutate(prop = n / sum(n)) %>%
+  slice_max(order_by = prop, n = 5) %>%
+  ungroup() %>%
+  ggplot(aes(x = cluster, y = prop, fill = property_type)) +
+  geom_col(width = 0.5, color = "black") +
+  geom_text(aes(label = percent(prop, accuracy = 1)),
+            position = position_stack(vjust = 0.5),
+            color = "white", fontface = "bold", size = 4) +
+  theme_bw() +
+  labs(
+    title = "Property Type by Cluster (Top 5)",
+    fill = NULL,
+    y = NULL
+  ) +
+  theme(
+    axis.text.y = element_blank()
+  )
+
+```
+
+```{r}
+#setting environment seed
+set.seed(12345)
+
+```
+
+```{r}
+#model creation and evaluation
+
+#creating the lm model -> using to predict log_price based on geography type, evaluating R squared and statistical significance
+lm_model <- lm(log_price ~ type, data = df)
+
+#table summary. Only 3% R squared but it is okay because this is just a directional analysis
+summary(lm_model)
+
+#Q-Q plot shows residuals mostly follow the normal distribution, but is skewed at the upper end. LOOK INTO CLEANING THE DATA MORE
+qqnorm(residuals(lm_model))
+qqline(residuals(lm_model), col = "red")
+
+#cook's distance shows that none of our skewed values are influential points
+plot(lm_model, which = 4)
+
+#This compelling. It shows that the geographic type affects price, by up to 100%
+```
+
+```{r}
+#Further analysis on cleaning up the upper ends of log_price
+#set to trim the data set to the 1st and 99th percentile. will cut off outliers and $0
+
+quants <- quantile(df$price, c(0.01,0.99), na.rm = TRUE)
+
+df_trim <- df %>%
+  filter(price > 0, price >= quants[1], price <= quants[2]) %>%
+  mutate(log_price = log(price))
+
+head(df_trim)
+
+```
+
+```{r}
+#New price distributions
+
+df_trim %>%
+  ggplot(aes(x = price)) +
+  geom_histogram() +
+  labs(
+    title = "Distribution of price",
+    y = "Frequency"
+  ) +
+  theme_bw()
+
+#after log_price transformation
+
+df_trim %>%
+  ggplot(aes(x = log_price)) +
+  geom_histogram() +
+  labs(
+    title = "Distribution of log_price",
+    y = "Frequency"
+  ) +
+  theme_bw()
+
+```
+
+```{r}
+#NEW model creation and evaluation
+
+lm_model1 <- lm(log_price ~ type, data = df_trim)
+
+#table summary. Only 3% R squared but it is okay because this is just a directional analysis
+summary(lm_model1)
+
+#Q-Q plot shows residuals mostly follow the normal distribution, but is skewed at the upper end. LOOK INTO CLEANING THE DATA MORE
+qqnorm(residuals(lm_model1))
+qqline(residuals(lm_model1), col = "red")
+
+#cook's distance shows that none of our skewed values are influential points
+plot(lm_model1, which = 4)
+
+```
+
+
+```{r}
+#KNN Model
+#logging cluster results DONT RUN THIS
+df_trim$log_price_scale <- scale(df_trim$log_price)
+
+km_model <- kmeans(df_trim$log_price_scale, centers = 3)
+
+#assigning clusters
+df_trim$cluster <- as.factor(km_model$cluster)
+
+#plotting the model
+df_trim %>%
+  ggplot(aes(x = longitude, y = latitude, color = cluster)) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "K-Means Clusters with Price and Location")
+
+#checking distribution of clusters
+df_trim %>%
+  ggplot(aes(x = cluster, fill = cluster)) +
+  geom_bar() +
+  theme_bw() +
+  labs(
+    title = "Distribution of Price Clusters",
+    y = "Frequency",
+    x = NULL
+  ) +
+   geom_text(stat = "count",
+             aes(label = ..count.., y = ..count../2),
+             color = "white",
+             fontface = "bold")
+  
+
+#checking prices by cluster
+df_trim %>%
+  ggplot(aes(y = log_price, x = cluster, fill = cluster)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(
+    title = "Price Distribution by Cluster",
+    x = NULL
+  )
+
+
+
+```
+
+```{r}
+#creating the hawaii map
+world_map <- map_data("world")
+
+map <- world_map %>%
+  filter(long > -161 & long < -154, lat > 18 & lat < 23)
+
+ggplot() +
+  geom_polygon(data = map, aes(x = long, y = lat, group = group),
+               fill = "grey90", color = "black") +
+  geom_point(data = df_trim, aes(x = longitude, y = latitude, color = cluster),
+             alpha = 0.6) +
+  coord_fixed(1.3) +
+  theme_bw() +
+  labs(title = "K-Means Clusters with Price and Location")
+```
+
+
+
